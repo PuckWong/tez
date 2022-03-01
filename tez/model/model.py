@@ -1,7 +1,7 @@
 """
 The tez model class
 """
-
+## fgm
 import warnings
 
 import psutil
@@ -51,7 +51,8 @@ class Model(nn.Module):
         self.metrics["test"] = {}
         self.clip_grad_norm = None
         self.using_tpu = False
-
+        self.backup = {}
+        self.multigpu = False
     @property
     def model_state(self):
         return self._model_state
@@ -96,6 +97,7 @@ class Model(nn.Module):
         valid_shuffle,
         accumulation_steps,
         clip_grad_norm,
+        multigpu,
     ):
 
         if callbacks is None:
@@ -138,12 +140,29 @@ class Model(nn.Module):
             self.scheduler = self.fetch_scheduler()
 
         self.fp16 = fp16
+        self.multigpu = multigpu
         if self.fp16:
             self.scaler = torch.cuda.amp.GradScaler()
-
+        if self.multigpu:
+            self = torch.nn.DataParallel(self)
         self._callback_runner = CallbackRunner(callbacks, self)
         self.train_state = enums.TrainingState.TRAIN_START
-
+    def attack(self, epsilon=1.0, emb_name='word_embeddings'):
+        # emb_name这个参数要换成你模型中embedding的参数名
+        for name, param in self.named_parameters():
+            if param.requires_grad and emb_name in name:
+                self.backup[name] = param.data.clone()
+                norm = torch.norm(param.grad)
+                if norm != 0:
+                    r_at = epsilon * param.grad / norm
+                    param.data.add_(r_at)
+    def restore(self, emb_name='word_embeddings'):
+        # emb_name这个参数要换成你模型中embedding的参数名
+        for name, param in self.named_parameters():
+            if param.requires_grad and emb_name in name: 
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
     def monitor_metrics(self, *args, **kwargs):
         return
 
@@ -165,19 +184,35 @@ class Model(nn.Module):
         if self.fp16:
             with torch.cuda.amp.autocast():
                 output, loss, metrics = self(**data)
+                
         else:
             output, loss, metrics = self(**data)
         return output, loss, metrics
-
+    
     def train_one_step(self, data):
         if self.accumulation_steps == 1 and self.batch_index == 0:
             self.zero_grad()
         _, loss, metrics = self.model_fn(data)
         loss = loss / self.accumulation_steps
+        if self.multigpu:
+            loss = loss.mean()
         if self.fp16:
             self.scaler.scale(loss).backward()
+            
         else:
             loss.backward()
+            
+        self.attack()
+        _, loss_adv, _ = self.model_fn(data)
+        if self.multigpu:
+            loss_adv = loss_adv.mean()
+        if self.fp16:
+            self.scaler.scale(loss_adv).backward()
+            
+        else:
+            loss_adv.backward()
+        self.restore()
+        
         if self.clip_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(self.parameters(), self.clip_grad_norm)
         if (self.batch_index + 1) % self.accumulation_steps == 0:
@@ -221,13 +256,13 @@ class Model(nn.Module):
         if self.using_tpu:
             tk0 = data_loader
         else:
-            tk0 = tqdm(data_loader, total=len(data_loader))
+            tk0 = data_loader#tqdm(data_loader, total=len(data_loader))
         for b_idx, data in enumerate(tk0):
             self.batch_index = b_idx
             self.train_state = enums.TrainingState.TRAIN_STEP_START
             loss, metrics = self.train_one_step(data)
             self.train_state = enums.TrainingState.TRAIN_STEP_END
-            losses.update(loss.item() * self.accumulation_steps, data_loader.batch_size)
+            losses.update(loss.item(), data_loader.batch_size)
             if b_idx == 0:
                 metrics_meter = {k: AverageMeter() for k in metrics}
             monitor = {}
@@ -235,14 +270,15 @@ class Model(nn.Module):
                 metrics_meter[m_m].update(metrics[m_m], data_loader.batch_size)
                 monitor[m_m] = metrics_meter[m_m].avg
             self.current_train_step += 1
-            if not self.using_tpu:
-                tk0.set_postfix(loss=losses.avg, stage="train", **monitor)
+            #if not self.using_tpu:
+            #    tk0.set_postfix(loss=losses.avg, stage="train", **monitor)
+            if b_idx%100==0:print(f"train step: {self.current_train_step} loss: {losses.avg}")
             if self.using_tpu:
                 print(f"train step: {self.current_train_step} loss: {losses.avg}")
-        if not self.using_tpu:
-            tk0.close()
+        #if not self.using_tpu:
+        #    tk0.close()
         self.update_metrics(losses=losses, monitor=monitor)
-
+        self.current_train_step = 0
         return losses.avg
 
     def validate_one_epoch(self, data_loader):
@@ -252,7 +288,7 @@ class Model(nn.Module):
         if self.using_tpu:
             tk0 = data_loader
         else:
-            tk0 = tqdm(data_loader, total=len(data_loader))
+            tk0 = data_loader#tqdm(data_loader, total=len(data_loader))
         for b_idx, data in enumerate(tk0):
             self.train_state = enums.TrainingState.VALID_STEP_START
             with torch.no_grad():
@@ -265,11 +301,11 @@ class Model(nn.Module):
             for m_m in metrics_meter:
                 metrics_meter[m_m].update(metrics[m_m], data_loader.batch_size)
                 monitor[m_m] = metrics_meter[m_m].avg
-            if not self.using_tpu:
-                tk0.set_postfix(loss=losses.avg, stage="valid", **monitor)
+            #if not self.using_tpu:
+            #    tk0.set_postfix(loss=losses.avg, stage="valid", **monitor)
             self.current_valid_step += 1
-        if not self.using_tpu:
-            tk0.close()
+        #if not self.using_tpu:
+        #    tk0.close()
         self.update_metrics(losses=losses, monitor=monitor)
         return losses.avg
 
@@ -296,7 +332,7 @@ class Model(nn.Module):
         if self.using_tpu:
             tk0 = data_loader
         else:
-            tk0 = tqdm(data_loader, total=len(data_loader))
+            tk0 = data_loader#tqdm(data_loader, total=len(data_loader))
 
         for _, data in enumerate(tk0):
             with torch.no_grad():
@@ -304,19 +340,24 @@ class Model(nn.Module):
                 out = self.process_output(out)
                 yield out
 
-            if not self.using_tpu:
-                tk0.set_postfix(stage="test")
+            #if not self.using_tpu:
+            #    tk0.set_postfix(stage="test")
 
-        if not self.using_tpu:
-            tk0.close()
+        #if not self.using_tpu:
+        #    tk0.close()
 
     def save(self, model_path, weights_only=False):
-        model_state_dict = self.state_dict()
+        if self.multigpu:
+            model_to_save = self.module if hasattr(self, 'module') else self
+            model_state_dict = model_to_save.state_dict()
+        else:
+            model_state_dict = self.state_dict()
         if weights_only:
             if self.using_tpu:
                 xm.save(model_state_dict, model_path)
             else:
                 torch.save(model_state_dict, model_path)
+                
             return
         if self.optimizer is not None:
             opt_state_dict = self.optimizer.state_dict()
@@ -372,6 +413,7 @@ class Model(nn.Module):
         valid_shuffle=False,
         accumulation_steps=1,
         clip_grad_norm=None,
+        multigpu=False,
     ):
         """
         The model fit function. Heavily inspired by tf/keras, this function is the core of Tez and this is the only
@@ -402,6 +444,7 @@ class Model(nn.Module):
             valid_shuffle=valid_shuffle,
             accumulation_steps=accumulation_steps,
             clip_grad_norm=clip_grad_norm,
+            multigpu=multigpu,
         )
 
         for _ in range(epochs):
