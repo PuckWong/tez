@@ -11,6 +11,29 @@ from tez import enums
 from tez.callbacks import CallbackRunner
 from tez.utils import AverageMeter
 from tqdm import tqdm
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+#Multiple GPU Train Initialization
+rank = int(os.environ['RANK'])
+local_rank = int(os.environ['LOCAL_RANK'])
+torch.cuda.set_device(rank % torch.cuda.device_count())
+dist.init_process_group(backend='nccl')  # 'nccl' initialization is mostly used
+DEVICE = torch.device("cuda", local_rank)
+dist.barrier()
+
+def reduce_value(value, average=True):
+    word_size = 8  # Trained on 8 A100 GPUs now
+    with torch.no_grad():
+        dist.all_reduce(value)
+        if average:
+            value /= word_size
+    return value
+
+
+def is_main_proc():
+    return rank == 0
+
 
 try:
     import torch_xla
@@ -144,7 +167,8 @@ class Model(nn.Module):
         if self.fp16:
             self.scaler = torch.cuda.amp.GradScaler()
         if self.multigpu:
-            self = torch.nn.DataParallel(self)
+            #self = torch.nn.DataParallel(self)
+            self = DDP(self, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
         self._callback_runner = CallbackRunner(callbacks, self)
         self.train_state = enums.TrainingState.TRAIN_START
     def attack(self, epsilon=1.0, emb_name='word_embeddings'):
